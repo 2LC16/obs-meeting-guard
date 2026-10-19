@@ -7,7 +7,7 @@
 用途:
   1. 调试"腾讯会议/企业微信会议"窗口检测: 开会时运行本工具,
      找到会议窗口的标题和类名, 填到 config.ini 的 [meeting] 段;
-  2. 确认企业微信会议是由哪个进程承载的(wemeetapp.exe 还是 WXWorkWeb.exe)。
+  2. 确认企业微信会议是由哪个进程承载的(wwmapp.exe / wemeetapp.exe / WXWorkWeb.exe)。
 
 用法:
   python list_windows.py              # 列出所有窗口

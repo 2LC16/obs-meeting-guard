@@ -12,7 +12,9 @@
   6. --dry-run 模拟运行 -> 不真正停止;
   7. auto_start_recording -> 检测到会议自动开始录屏;
   8. 画面静止 + 桌面音频仍有声(> -45 dB) -> 不停止(静止门控);
-  9. static_require_quiet=false -> 静止条件可独立触发。
+  9. static_require_quiet=false -> 静止条件可独立触发;
+  10. 有音频时静止计时被清零(音频转安静后需重新累积才触发);
+  11. db=-inf(数字静音)被视为安静: 静止条件可触发, 且不会误判为"有声"清零计时。
 不依赖真实的腾讯会议与 OBS。
 """
 import logging
@@ -206,10 +208,10 @@ def main():
         run_loop(g8, 2.0)
         check("⑧ 有音频时静止不停止", server.stop_count == before,
               "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
-        # 音频随后也安静下来 -> 静止条件解锁, 应停止
+        # 音频随后安静下来, 但有声期间静止计时已被清零 -> 不会凭陈旧计时立即停止
         g8.audio.db = -60.0
         run_loop(g8, 2.0)
-        check("⑧b 音频转安静后停止", server.stop_count == before + 1,
+        check("⑧b 音频转安静不凭陈旧计时误停", server.stop_count == before,
               "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
 
         # 场景9: 关闭 static_require_quiet -> 静止条件独立触发(仍有音频也停)
@@ -225,6 +227,56 @@ def main():
         run_loop(g9, 2.0)
         check("⑨ 关闭门控后静止可独立触发", server.stop_count == before + 1,
               "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
+
+        # 场景10: 有音频时清除静止计时(不清会让陈旧计时在音频转安静瞬间误触停)
+        server.recording = True
+        before = server.stop_count
+        g10 = make_guard(server, meeting_active=True)
+        guards.append(g10)
+        run_loop(g10, 0.8)
+        g10.audio.db = -30.0           # 仍有声
+        g10.audio.quiet = 0.0
+        g10.screen.static_seconds = 999.0
+        run_loop(g10, 2.0)
+        check("⑩ 有音频时静止计时被清零", g10.screen.static_seconds == 0.0,
+              "static_seconds=%.1f" % g10.screen.static_seconds)
+        check("⑩b 有音频时不会误停", server.stop_count == before,
+              "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
+        # 音频转安静 + 画面重新静止 -> 重新累积后才停(不会一安静就立即触发)
+        g10.audio.db = -60.0
+        g10.screen.static_seconds = 999.0
+        run_loop(g10, 2.0)
+        check("⑩c 安静后静止仍可触发", server.stop_count == before + 1,
+              "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
+
+        # 场景11: db=-inf(数字静音, RMS=0)必须被认定为"安静"
+        server.recording = True
+        before = server.stop_count
+        g11 = make_guard(server, meeting_active=True)
+        guards.append(g11)
+        run_loop(g11, 0.8)
+        g11.audio.db = float("-inf")   # 数字静音: 低于任何阈值, 等价于极安静
+        g11.audio.quiet = 0.0
+        g11.screen.static_seconds = 999.0
+        run_loop(g11, 2.0)
+        check("⑪ -inf 视为安静, 静止条件可触发", server.stop_count == before + 1,
+              "stop_count=%d(+%d)" % (server.stop_count, server.stop_count - before))
+
+        # 场景11b: -inf 不是"有声" -> 不清除静止计时(不清零才算认定它为安静)
+        # 注意: 先让 OBS 侧变为"未录屏", 否则守护会因静止满阈值走停止流程重置计时,
+        # 就隔离不出"有声清零逻辑是否触发"了。
+        server.recording = False
+        g11b = make_guard(server, meeting_active=True)
+        guards.append(g11b)
+        g11b.recording = False          # 不评估停止条件, 单独验证清零逻辑
+        run_loop(g11b, 0.8)
+        g11b.audio.db = float("-inf")
+        g11b.screen.static_seconds = 50.0
+        run_loop(g11b, 1.0)
+        check("⑪b -inf 不清除静止计时(是安静不是有声)",
+              g11b.screen.static_seconds == 50.0,
+              "static_seconds=%.1f" % g11b.screen.static_seconds)
+        server.recording = True
 
     except Exception:
         import traceback

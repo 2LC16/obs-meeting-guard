@@ -11,22 +11,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo === 1/6 Screen static detection ===
+echo === 1/7 Screen static detection ===
 python tests\test_screen.py
 echo.
-echo === 2/6 Desktop audio capture ===
+echo === 2/7 Desktop audio capture ===
 python tests\test_audio.py
 echo.
-echo === 3/6 OBS WebSocket protocol ===
+echo === 3/7 Audio quiet timer (real-clock rate) ===
+python tests\test_audio_timer.py
+echo.
+echo === 4/7 OBS WebSocket protocol ===
 python tests\test_obs_ws.py
 echo.
-echo === 4/6 Guard end-to-end ===
+echo === 5/7 Guard end-to-end ===
 python tests\test_guard_e2e.py
 echo.
-echo === 5/6 GUI unit test ===
+echo === 6/7 GUI unit test ===
 python tests\test_gui.py
 echo.
-echo === 6/6 GUI exe end-to-end ===
+echo === 7/7 GUI exe end-to-end ===
 python tests\e2e_gui_exe.py
 echo.
 echo All tests finished.

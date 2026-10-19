@@ -8,15 +8,19 @@ OBS 会议守护 (OBS Meeting Guard)
         1) 腾讯会议结束(会议窗口消失超过宽限期, 默认 30 秒);
         2) 画面连续静止超过设定时长(默认 900 秒 = 15 分钟);
            —— 仅当桌面音频同时处于安静状态(低于阈值)时才触发:
-              会议仍在发声(> -45 dB)时, 即使画面静止也不会停止录屏;
+              会议仍在发声(> -45 dB)时, 即使画面静止也不会停止录屏,
+              并且静止计时会被清零, 需在安静状态下重新累计;
         3) 桌面音频电平(系统输出混音, 不含麦克风)持续低于设定阈值
            (默认 -45 dB)超过设定时长(默认 720 秒 = 12 分钟)。
+           安静计时按真实时钟累计(与 Windows 音频引擎供数快慢无关);
+           桌面完全静音时电平为 -inf(数字静音, 等价于低于任何阈值),
+           没有任何程序播放时引擎不供数据, 同样按静音持续计时。
 
 特点:
   - 纯 Python 标准库实现, 运行无需安装任何第三方依赖;
   - 自带极简 OBS WebSocket 客户端(实现 obs-websocket v5 协议);
   - WASAPI 环回采集桌面音频; ctypes 直接截屏做画面静止检测;
-  - 会议检测同时覆盖: 独立版腾讯会议(wemeetapp.exe)与企业微信
+  - 会议检测同时覆盖: 独立版腾讯会议(wemeetapp.exe / wwmapp.exe)与企业微信
     (WXWork.exe / WXWorkWeb.exe, 融合版会议窗口类名为 Meeting* / Qt*);
   - 支持 --selftest 一键自检, --dry-run 模拟运行, --list-windows 查看窗口;
   - 可用 PyInstaller 打包为单文件 exe(见 build_exe.bat)。
@@ -82,7 +86,7 @@ DEFAULT_CONFIG = {
         "auto_start_recording": "false",
     },
     "meeting": {
-        "process_names": "wemeetapp.exe,WXWork.exe,WXWorkWeb.exe",
+        "process_names": "wemeetapp.exe,wwmapp.exe,WXWork.exe,WXWorkWeb.exe",
         "min_width": "500",
         "min_height": "350",
         "meeting_class_keywords": "Meeting,Qt",
@@ -288,11 +292,17 @@ class BITMAPINFO(ctypes.Structure):
                 ("bmiColors", wintypes.DWORD * 3)]
 
 
+# 数字静音: 采样数据全为 0(RMS=0)时, 电平是负无穷 dB。
+# 负无穷小于任何安静阈值, 做"< 阈值"比较时天然算安静; 这里单独定义常量,
+# 是为了在代码里显式写下这个约定, 避免以后误把 -inf 当成"无效值/采集失败"处理。
+SILENCE_DB = float("-inf")
+
+
 def fmt_db(db):
-    """把 dB 数值格式化为可读字符串"""
+    """把 dB 数值格式化为可读字符串(-inf 即数字静音, 也就是完全安静)"""
     if db is None:
         return "N/A"
-    if db == float("-inf"):
+    if db == SILENCE_DB:
         return "-inf"
     return "%.1f" % db
 
@@ -339,8 +349,9 @@ class LoopbackAudioMonitor(threading.Thread):
         self._stop_evt = threading.Event()
         self.lock = threading.Lock()
         self.current_db = None       # 最近一个音频块的电平(dBFS), None 表示暂无数据
-        self.quiet_seconds = 0.0     # 连续安静时长(秒)
+        self.quiet_seconds = 0.0     # 连续安静时长(秒, 按真实时钟累计)
         self.last_update = 0.0       # 最近一次成功采集的时间(单调时钟)
+        self._last_read_ts = None    # 上一次成功读数的时刻(单调时钟), 用于按真实间隔累计安静时间
         self.status = "初始化中"      # 初始化中/运行中/无可用设备/采集错误/已停止
         self.error_msg = ""
         self.device_info = ""        # 音频格式描述(采样率/位深/声道)
@@ -371,6 +382,9 @@ class LoopbackAudioMonitor(threading.Thread):
             }
 
     def reset_quiet(self):
+        """清零安静计时(录屏开始/结束时由守护调用)。
+        计时按"距上次读数的真实间隔"累加, 所以清零是精确的:
+        下次读数只会补上清零之后新经过的时间。"""
         with self.lock:
             self.quiet_seconds = 0.0
 
@@ -531,6 +545,12 @@ class LoopbackAudioMonitor(threading.Thread):
         if hr != 0:
             raise OSError("GetCurrentPadding 失败, HRESULT=0x%08X" % (hr & 0xFFFFFFFF))
         if padding.value == 0:
+            # 引擎没有供任何新数据。共享模式下, 当没有任何程序向播放设备
+            # 输出(无渲染流)时, 引擎不会往缓冲区写数据, padding 会一直是 0
+            # (实测静置 11 秒 222 次采样全是 0)。没有程序在放声音, 就等于
+            # 桌面静音, 所以这里按"数字静音"推进安静计时; 若直接返回, 完全
+            # 静音的桌面上安静条件将永远不计时。
+            self._update_quiet_timer(SILENCE_DB, time.monotonic())
             return
 
         data_ptr = ctypes.c_void_p()
@@ -549,23 +569,34 @@ class LoopbackAudioMonitor(threading.Thread):
         n_frames = frames.value
         try:
             if n_frames == 0 or (flags.value & AUDCLNT_BUFFERFLAGS_SILENT):
-                db = float("-inf")  # 静音块
+                db = SILENCE_DB  # 静音块(全零数据), 等价于完全安静
             else:
                 nbytes = n_frames * self._block_align
                 raw = ctypes.string_at(data_ptr.value, nbytes)
                 db = self._calc_db(raw)
         finally:
             com_call(self._capture, IAUDIOCAPTURECLIENT_RELEASEBUFFER, ctypes.c_long,
-                     [ctypes.c_uint32], n_frames)  # ReleaseBuffer
+                      [ctypes.c_uint32], n_frames)  # ReleaseBuffer
 
-        duration = n_frames / float(self._rate)
+        # 用真实时钟(单调时钟)更新安静计时。
+        # 为什么不按音频块时长(n_frames/采样率)累加: 桌面静音时 Windows 音频
+        # 引擎供数变慢(块变少/变小), 按块时长累加会让计时远慢于真实时间
+        # (实测只有约 14%——安静 6 秒只计了 0.8 秒); 按"两次读数之间的真实
+        # 间隔"累加则供数快慢都不影响, 计时与真实世界的一秒一致。
+        self._update_quiet_timer(db, time.monotonic())
+
+    def _update_quiet_timer(self, db, now):
+        """按真实时钟更新安静计时(独立成方法, 便于不插声卡也能测试)。
+        db < 阈值(含 -inf 数字静音)时累加"距上次读数的真实间隔"; 否则清零。"""
         with self.lock:
             self.current_db = db
-            self.last_update = time.monotonic()
+            self.last_update = now
             if db < self.threshold_db:
-                self.quiet_seconds += duration
+                if self._last_read_ts is not None:
+                    self.quiet_seconds += now - self._last_read_ts
             else:
                 self.quiet_seconds = 0.0
+            self._last_read_ts = now
 
     def _calc_db(self, raw):
         """计算一个音频块的 RMS 电平, 返回 dBFS"""
@@ -585,7 +616,7 @@ class LoopbackAudioMonitor(threading.Thread):
             mean_sq = _sum_of_squares(samples) / len(samples) if samples else 0.0
             rms = math.sqrt(mean_sq) / self._full_scale
         if rms <= 0.0:
-            return float("-inf")
+            return SILENCE_DB
         return 20.0 * math.log10(rms)
 
     def _release_device(self):
@@ -1322,6 +1353,7 @@ class MeetingGuard(object):
         self._stop_retry_at = 0.0
         self._just_stopped = False
         self._audio_warned = False
+        self._last_static_reset_log = 0.0  # 上次记录"有声清除静止计时"的时间(节流用)
 
     # ------------------------------------------------------------ 生命周期
     def run(self):
@@ -1407,6 +1439,18 @@ class MeetingGuard(object):
         # 3) 音频/屏幕数据更新
         self.screen.poll(now)
         audio_snap = self.audio.snapshot()
+        # 桌面音频仍有声时, 清除画面静止计时:
+        # 静止条件以音频安静为前提, 若有声期间累计的计时不清零, 之后某个瞬间
+        # 音频恰好低于阈值就会让"陈旧"的静止计时立即满足阈值导致误停。
+        if (g["static_require_quiet"] and audio_snap["db"] is not None
+                and audio_snap["db"] >= g["quiet_threshold_db"]
+                and self.screen.static_seconds > 0):
+            had_static = self.screen.static_seconds
+            self.screen.reset()
+            if now - self._last_static_reset_log >= 60:  # 最多每分钟记一条, 避免刷屏
+                self._last_static_reset_log = now
+                self.log.debug("桌面音频有声(%.1f dB), 已清除画面静止计时(此前 %.0f 秒)",
+                               audio_snap["db"], had_static)
         if not self._audio_warned and now > 3.0:
             self._audio_warned = True
             if audio_snap["status"] != "运行中":
@@ -2717,10 +2761,11 @@ auto_start_recording = false
 
 [meeting]
 # 要监视的进程名(逗号分隔, 不区分大小写):
-#   wemeetapp.exe       独立版腾讯会议
+#   wemeetapp.exe       独立版腾讯会议(旧版进程)
+#   wwmapp.exe          独立版腾讯会议(新版进程, 窗口类名 Qt5158QWindowIcon)
 #   WXWork.exe          企业微信主进程(融合版会议承载进程)
 #   WXWorkWeb.exe       企业微信嵌入浏览器进程
-process_names = wemeetapp.exe,WXWork.exe,WXWorkWeb.exe
+process_names = wemeetapp.exe,wwmapp.exe,WXWork.exe,WXWorkWeb.exe
 # 会议窗口的最小尺寸(像素); 小于该尺寸的窗口(悬浮工具条/提示)会被忽略
 min_width = 500
 min_height = 350

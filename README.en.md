@@ -17,11 +17,13 @@ It calls OBS's `StopRecord` as soon as **any** of these conditions is met:
 | ② | The screen has been static for a set duration (**and desktop audio is quiet at the same time**) | 900 s (15 min) |
 | ③ | Desktop audio level (system output mix, **microphone excluded**) stayed below a threshold | -45 dB for 720 s (12 min) |
 
-> **Gating for condition ②**: while the meeting is still producing sound (desktop audio > -45 dB), a static screen will **not** stop the recording — this avoids false stops when someone is sharing a static slide but still talking. Set `static_require_quiet = false` to disable the gate.
+> **Gating for condition ②**: while the meeting is still producing sound (desktop audio > -45 dB), a static screen will **not** stop the recording — this avoids false stops when someone is sharing a static slide but still talking. The static timer is also **reset** in that case, so it must accumulate from scratch once audio turns quiet (prevents a stale timer from firing during a momentary dip). Set `static_require_quiet = false` to disable the gate.
+
+> **Timing accuracy**: the quiet timer counts **real wall-clock time** (independent of how fast the Windows audio engine feeds data); a fully silent desktop reads `-inf` (digital silence), which counts as below any threshold; and when no program is playing at all (the engine feeds nothing), the time is still counted as quiet.
 
 ## Highlights
 
-- **Covers both meeting clients**: standalone Tencent Meeting (`wemeetapp.exe`) and WeCom meetings (`WXWork.exe`; meeting window class names `Meeting*` / `Qt*` verified from the binaries);
+- **Covers all meeting clients**: standalone Tencent Meeting (`wemeetapp.exe` / `wwmapp.exe`, the new client whose window class is `Qt5158QWindowIcon`) and WeCom meetings (`WXWork.exe`; meeting window class names `Meeting*` / `Qt*` verified from the binaries);
 - **GUI + console dual mode**: a native status window (status lights + progress bars + live log) by default, or plain console logging with `--console`;
 - **Pure Python standard library** — zero third-party dependencies at runtime (the UI is a native Win32 window, no tkinter);
 - Ships a minimal OBS WebSocket client (obs-websocket v5 protocol, with password auth, auto-reconnect and version adaptation);
@@ -81,7 +83,7 @@ The status window has four areas:
 The main loop runs once per second (identical logic in GUI and console mode):
 
 1. **Meeting detection**: enumerate top-level windows of the Tencent Meeting / WeCom processes; a meeting window is judged by "class name contains `Meeting`/`Qt` + size above minimum + title not a main window" (all rules adjustable in `config.ini`);
-2. **Audio capture** (separate thread): WASAPI loopback continuously captures the default playback mix, computes the RMS level (dBFS) and accumulates "below -45 dB" duration;
+2. **Audio capture** (separate thread): WASAPI loopback continuously captures the default playback mix, computes the RMS level (dBFS) and accumulates "below -45 dB" duration. The quiet timer counts **real wall-clock time** between reads, so engine feed-rate doesn't matter; when nothing is playing (the engine feeds nothing) the time still counts as quiet, with the level recorded as `-inf`;
 3. **Screen detection**: every 30 s capture the whole virtual screen and compare mean absolute difference against the previous frame; below threshold counts as "no change";
 4. **OBS state**: poll every 2 s whether a recording is running;
 5. **Condition evaluation**: only while OBS is actually recording; on any condition met, call `StopRecord` and reset all timers;
@@ -90,7 +92,7 @@ The main loop runs once per second (identical logic in GUI and console mode):
 Notes:
 
 - The "meeting ended" condition only arms after a meeting has been seen **during the current recording**, so recording something else never gets falsely stopped;
-- **The static-screen condition is gated by quiet desktop audio by default**: while the level is above -45 dB (someone is talking), static time still accumulates but never triggers, and the progress bar says "(audio active, won't trigger)". Set `static_require_quiet = false` to make it independent;
+- **The static-screen condition is gated by quiet desktop audio by default**: while the level is above -45 dB (someone is talking), the static timer is reset and must re-accumulate the full `static_duration_sec` after audio turns quiet, and the progress bar says "(audio active, won't trigger)". Set `static_require_quiet = false` to make it independent;
 - Dry-run mode only logs "would stop now" without touching OBS — great for tuning thresholds;
 - A heartbeat line is logged every 5 minutes so you can confirm the guard is alive.
 
@@ -124,7 +126,7 @@ All thresholds live in `config.ini`; save and restart to apply. The repo's [conf
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| process_names | wemeetapp.exe,WXWork.exe,WXWorkWeb.exe | Processes to watch |
+| process_names | wemeetapp.exe,wwmapp.exe,WXWork.exe,WXWorkWeb.exe | Processes to watch (wwmapp.exe = new Tencent Meeting client) |
 | min_width / min_height | 500 / 350 | Minimum meeting window size (filters floating toolbars) |
 | meeting_class_keywords | Meeting,Qt | Window class containing any keyword → meeting window |
 | meeting_title_keywords | empty | Title containing any keyword → also a meeting window (off by default) |
@@ -175,6 +177,9 @@ Check `guard.log` meeting-detection lines: if it kept saying "no meeting window"
 **Q: Desktop audio capture unavailable?**
 The self test tells you why (typical on machines without a playback device). The quiet condition is disabled then; the others still work.
 
+**Q: The desktop is completely silent (level shows -inf) — does the quiet timer still run?**
+Yes. `-inf` is digital silence (all-zero samples), equivalent to an extremely low level, and accumulates as "below -45 dB" normally; and when no program is playing at all (the Windows audio engine feeds nothing), the time is still counted as quiet. The quiet timer always counts real time — it never runs slower than the wall clock.
+
 **Q: I minimize the meeting window during calls — does it still count?**
 A minimized meeting window still counts as "in a meeting". If desktop audio is also quiet, the static condition can still stop the recording after 15 minutes; raise `static_duration_sec` if undesired.
 
@@ -194,7 +199,7 @@ cd tests
 run_all.bat
 ```
 
-Covers: static-screen detection (8 checks), audio capture, OBS protocol (13), end-to-end guard logic (10, including the "static but audio active" gate), GUI (23), and GUI-exe end-to-end (6) — 61 assertions in total.
+Covers: static-screen detection (8 checks), audio capture, audio quiet timer (11, real-clock rate and -inf semantics), OBS protocol (13), end-to-end guard logic (15, including the "static but audio active" gate and "timer reset on sound" scenarios), GUI (23), and GUI-exe end-to-end (6) — 76 assertions in total.
 
 ## Repository layout
 
