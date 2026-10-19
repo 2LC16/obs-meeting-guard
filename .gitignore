@@ -1,1 +1,15 @@
-# Runtime log files (auto-rotating)guard.logguard.log.*# PyInstaller build artifacts (exes ship via GitHub Releases, not in the repo)*.exebuild/dist/*.spec# Python__pycache__/*.py[cod].venv/venv/
+# 运行时生成的日志(自动滚动)
+guard.log
+guard.log.*
+
+# PyInstaller 打包产物(exe 走 GitHub Release, 不入库)
+*.exe
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

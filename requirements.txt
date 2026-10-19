@@ -1,0 +1,9 @@
+# OBS Meeting Guard - Python dependencies
+#
+# This tool uses ONLY the Python standard library.
+# No third-party packages are required to run it.
+#
+# Requirements: Windows 10/11 + Python 3.8 or newer
+#
+# Optional (only needed to rebuild the .exe):
+#   python -m pip install pyinstaller
